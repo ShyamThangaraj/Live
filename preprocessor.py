@@ -1,5 +1,5 @@
 """
-MnemoniSync Preprocessing Pipeline
+Live Preprocessing Pipeline
 Runs before VGGT receives any frames.
 Input: raw user video upload
 Output: clean, normalized frames ready for VGGT
