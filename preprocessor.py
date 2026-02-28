@@ -24,9 +24,10 @@ def probe_metadata(input_path):
     # - Derive: is_portrait (height > width), is_hdr (color_primaries == bt2020)
     # - Returns: metadata dict with all extracted values
     #   e.g. {"rotation": 90, "is_hdr": True, "is_portrait": True,
-    #          "width": 1080, "height": 1920, "fps": 30, "duration": 8.4}
+    #          "width": 1080, "height": 1920, "fps": 30, "duration": 8.4}xcscxv
     # -------------------------------------------------------------------------
     pass  # returns: dict
+
 
 
 def tonemap_hdr_to_sdr(input_path, output_path, metadata):
