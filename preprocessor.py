@@ -1,5 +1,5 @@
 """
-Live Preprocessing Pipeline — Stage 0
+MnemoniSync Preprocessing Pipeline — Stage 0
 Runs before VGGT receives any frames.
 Input:  raw user video upload (any format, any era)
 Output: clean normalized frames ready for VGGT
@@ -177,7 +177,7 @@ def stabilize(input_path, output_path, temp_dir, metadata):
     #     is_modern   → smoothing=10, crop=black  (lighter smoothing)
     #
     # - Always runs — both archival and modern footage has shake
-    # - metadata param added vs previous version to enable era-specific strength
+    # - metadata param enables era-specific strength settings
     # - Returns: output_path
     pass  # returns: str
 
@@ -404,14 +404,16 @@ def preprocess(input_path, output_dir):
     selected_indices = select_frames(colorized_path, target_count=80)
 
     # Step 11: always runs — final output for VGGT
-    frames_dir = normalize_and_extract_frames(
+    # final_frames_dir kept separate from frames_dir to avoid overwriting
+    # the directory path defined at the top of this function
+    final_frames_dir = normalize_and_extract_frames(
         colorized_path,
         frames_dir,
         selected_indices
     )
 
     return {
-        "frames_dir":       frames_dir,
+        "frames_dir":       final_frames_dir,
         "masks_dir":        masks_dir,
         "thumbnails_dir":   thumbs_dir,
         "person_ids":       person_ids,
