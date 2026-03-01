@@ -119,6 +119,9 @@ def probe_metadata(input_path):
 
     rotation = int(video_stream.get("tags", {}).get("rotate", 0))
 
+    is_interlaced = field_order in ["tt", "bb"]
+    
+    
     print("codec:", codec)
     print("field_order:", field_order)
     print("color_primaries:", color_primaries)
