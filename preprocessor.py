@@ -113,13 +113,23 @@ def probe_metadata(input_path):
     nb_frames       = int(video_stream.get("nb_frames", 0))
     duration        = float(video_stream.get("duration", 0))
 
-    
-    
+    fps_raw = video_stream.get("r_frame_rate", "30/1")
+    num, den = fps_raw.split("/")
+    fps = float(num) / float(den)
 
-    
+    rotation = int(video_stream.get("tags", {}).get("rotate", 0))
 
-
-
+    print("codec:", codec)
+    print("field_order:", field_order)
+    print("color_primaries:", color_primaries)
+    print("color_transfer:", color_transfer)
+    print("pix_fmt:", pix_fmt)
+    print("width:", width)
+    print("height:", height)
+    print("fps:", fps)
+    print("duration:", duration)
+    print("nb_frames:", nb_frames)
+    print("rotation:", rotation)
 
 # =============================================================================
 # STEP 2: HDR TO SDR TONEMAPPING
