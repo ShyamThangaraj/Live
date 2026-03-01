@@ -1,5 +1,5 @@
 """
-MnemoniSync Preprocessing Pipeline — Stage 0
+Live Preprocessing Pipeline — Stage 0
 Runs before VGGT receives any frames.
 Input:  raw user video upload (any format, any era)
 Output: clean normalized frames ready for VGGT
@@ -81,7 +81,44 @@ def probe_metadata(input_path):
     #     "is_interlaced": False,
     #     "is_black_and_white": False,
     #   }
-    pass  # returns: dict
+    
+    # returns: dict
+
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-show_streams",
+        "-show_format",
+        "-of", "json",
+        input_path
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    data = json.loads(result.stdout)
+
+    print(json.dumps(data, indent=2))
+
+    video_stream = next(
+    (s for s in data["streams"] if s.get("codec_type") == "video"), None)
+    if video_stream is None:
+        raise ValueError(f"No video stream found in {input_path}")
+    
+    codec           = video_stream.get("codec_name", "unknown")
+    field_order     = video_stream.get("field_order", "progressive")
+    color_primaries = video_stream.get("color_primaries", "unknown")
+    color_transfer  = video_stream.get("color_transfer", "unknown")
+    pix_fmt         = video_stream.get("pix_fmt", "unknown")
+    width           = int(video_stream.get("width", 0))
+    height          = int(video_stream.get("height", 0))
+    nb_frames       = int(video_stream.get("nb_frames", 0))
+    duration        = float(video_stream.get("duration", 0))
+
+    
+    
+
+    
+
+
 
 
 # =============================================================================
@@ -426,5 +463,6 @@ if __name__ == "__main__":
     import sys
     input_path = sys.argv[1]
     output_dir = sys.argv[2]
-    result = preprocess(input_path, output_dir)
-    print(json.dumps(result, indent=2))
+    probe_metadata(input_path); 
+    #result = preprocess(input_path, output_dir)
+    #print(json.dumps(result, indent=2))
