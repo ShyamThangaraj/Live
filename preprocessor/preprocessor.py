@@ -6,7 +6,7 @@ Output: clean normalized frames ready for VGGT
 
 Pipeline order matches Chapter 12 of the roadmap exactly,
 with additions for modern footage problems:
-HDR tonemapping, orientation correction, and frame selection.
+orientation correction, and frame selection.
 
 Each function returns its output path so the next step always
 receives the actual file that was written. Steps that are
@@ -78,7 +78,6 @@ def probe_metadata(input_path):
     #     "rotation": 90,
     #     "is_archival": False,
     #     "is_modern": True,
-    #     "is_hdr": True,
     #     "is_portrait": True,
     #     "is_interlaced": False,
     #     "is_black_and_white": False,
@@ -97,8 +96,6 @@ def probe_metadata(input_path):
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     data = json.loads(result.stdout)
-
-    print(json.dumps(data, indent=2))
 
     video_stream = next(
     (s for s in data["streams"] if s.get("codec_type") == "video"), None)
@@ -120,52 +117,59 @@ def probe_metadata(input_path):
     fps = float(num) / float(den)
 
     rotation = int(video_stream.get("tags", {}).get("rotate", 0))
-
+    
     is_interlaced = field_order in ["tt", "bb"]
+    
     is_black_and_white = _detect_black_and_white(input_path)
     
+    is_archival = (
+        is_interlaced
+        or codec in ["mpeg2video", "dvvideo", "huffyuv", "ffv1"]
+        or color_primaries in ["bt470bg", "smpte170m"]
+        or (width <= 720 and height <= 480)
+    )
 
-    print("codec:", codec)
-    print("field_order:", field_order)
-    print("color_primaries:", color_primaries)
-    print("color_transfer:", color_transfer)
-    print("pix_fmt:", pix_fmt)
-    print("width:", width)
-    print("height:", height)
-    print("fps:", fps)
-    print("duration:", duration)
-    print("nb_frames:", nb_frames)
-    print("rotation:", rotation)
+    is_modern = (
+        codec in ["hevc", "av1"]
+        or color_primaries == "bt2020"
+        or pix_fmt == "yuv420p10le"
+    )
 
-    print("is_black_and_white:", is_black_and_white)
-    print("is_interlaced:", is_interlaced)
+    if codec == "h264" and not is_archival:
+        if width >= 1280:
+            is_modern = True
+        else:
+            is_archival = True
+
+    if not is_archival and not is_modern:
+        is_archival = True
+
+    if rotation in [90, 270]:
+        is_portrait = width > height
+    else:
+        is_portrait = height > width
+
+    return {
+        "codec":              codec,
+        "field_order":        field_order,
+        "color_primaries":    color_primaries,
+        "color_transfer":     color_transfer,
+        "pix_fmt":            pix_fmt,
+        "width":              width,
+        "height":             height,
+        "fps":                fps,
+        "duration":           duration,
+        "nb_frames":          nb_frames,
+        "rotation":           rotation,
+        "is_archival":        is_archival,
+        "is_modern":          is_modern,
+        "is_portrait":        is_portrait,
+        "is_interlaced":      is_interlaced,
+        "is_black_and_white": is_black_and_white,
+    }
 
 # =============================================================================
-# STEP 2: HDR TO SDR TONEMAPPING
-# Modern footage only — archival footage predates HDR entirely.
-# Conditioned on metadata["is_hdr"].
-# =============================================================================
-
-def tonemap_hdr_to_sdr(input_path, output_path, metadata):
-    # - Check metadata["is_hdr"] — if False, skip and return input_path
-    #   Archival footage will never be HDR, skip always passes through
-    #   Modern iPhone footage is almost always HDR, will almost always convert
-    #
-    # - If True: run ffmpeg zscale + hable tonemap chain
-    #   filter chain:
-    #     zscale=t=linear:npl=100,
-    #     format=gbrpf32le,
-    #     zscale=p=bt709,
-    #     tonemap=tonemap=hable:desat=0,
-    #     zscale=t=bt709:m=bt709:r=tv,
-    #     format=yuv420p
-    # - Output must be yuv420p BT.709
-    # - Returns: output_path if converted, input_path if skipped
-    pass  # returns: str
-
-
-# =============================================================================
-# STEP 3: ORIENTATION CORRECTION
+# STEP 2: ORIENTATION CORRECTION
 # Modern footage only — archival cameras were always held landscape.
 # Conditioned on metadata["is_portrait"] and metadata["rotation"].
 # =============================================================================
@@ -189,7 +193,7 @@ def correct_orientation(input_path, output_path, metadata):
 
 
 # =============================================================================
-# STEP 4: DEINTERLACING + NOISE REDUCTION + DEFLICKER
+# STEP 3: DEINTERLACING + NOISE REDUCTION + DEFLICKER
 # Chapter 12, Step 1.
 # Deinterlacing: archival only — conditioned on metadata["is_interlaced"]
 # Noise reduction + deflicker: all footage, but strength differs by era
@@ -216,7 +220,7 @@ def deinterlace_and_denoise(input_path, output_path, metadata):
 
 
 # =============================================================================
-# STEP 5: VIDEO STABILIZATION
+# STEP 4: VIDEO STABILIZATION
 # Chapter 12, Step 2. Always runs — shake exists in both eras.
 # Strength differs: archival footage needs heavier smoothing.
 # =============================================================================
@@ -239,7 +243,7 @@ def stabilize(input_path, output_path, temp_dir, metadata):
 
 
 # =============================================================================
-# STEP 6: PERSON DETECTION AND TRACKING — Stage 0b
+# STEP 5: PERSON DETECTION AND TRACKING — Stage 0b
 # Always runs. SAM 2.1 + DeepFace. Runs before SeedVR2 (heavy compute)
 # as specified in roadmap: "must complete before any GPU-intensive work begins"
 # =============================================================================
@@ -270,8 +274,8 @@ def detect_and_track_persons(input_path, masks_dir, thumbnails_dir):
 
 
 # =============================================================================
-# STEP 7: PERSON MASKING FOR VGGT
-# Always runs. Uses masks from Step 6 to inpaint people out before
+# STEP 6: PERSON MASKING FOR VGGT
+# Always runs. Uses masks from Step 5 to inpaint people out
 # SeedVR2 so the upscaler never learns people as static scene geometry.
 # =============================================================================
 
@@ -287,7 +291,7 @@ def mask_people_for_vggt(input_path, output_path, masks_dir, person_ids):
 
 
 # =============================================================================
-# STEP 8: RESTORATION AND UPSCALING
+# STEP 7: RESTORATION AND UPSCALING
 # Chapter 12, Step 3. Always runs but tool selection differs by era.
 # Runs after person masking so SeedVR2 sees clean static scene only.
 # =============================================================================
@@ -316,7 +320,7 @@ def restore_and_upscale(input_path, output_path, metadata):
 
 
 # =============================================================================
-# STEP 9: COLORIZATION
+# STEP 8: COLORIZATION
 # Chapter 12, Step 5. Archival only — conditioned on metadata["is_black_and_white"]
 # Modern footage will never be black and white.
 # =============================================================================
@@ -340,7 +344,7 @@ def colorize(input_path, output_path, metadata):
 
 
 # =============================================================================
-# STEP 10: FRAME SELECTION
+# STEP 9: FRAME SELECTION
 # Always runs. Fixes back-and-forth movement, respects VGGT memory budget.
 # =============================================================================
 
@@ -361,7 +365,7 @@ def select_frames(input_path, target_count=80):
 
 
 # =============================================================================
-# STEP 11: FRAME EXTRACTION AND SCALE NORMALIZATION
+# STEP 10: FRAME EXTRACTION AND SCALE NORMALIZATION
 # Always runs. Final output — the only thing VGGT ever sees.
 # =============================================================================
 
@@ -391,75 +395,68 @@ def preprocess(input_path, output_dir):
     for d in [temp_dir, masks_dir, thumbs_dir, frames_dir]:
         os.makedirs(d, exist_ok=True)
 
-    # Step 1: probe — derives is_archival, is_modern, is_hdr, is_portrait,
+    # Step 1: probe — derives is_archival, is_modern, is_portrait,
     #                 is_interlaced, is_black_and_white, rotation
     #                 every downstream step reads from this dict
     metadata = probe_metadata(input_path)
 
-    # Step 2: modern only — skips automatically if not HDR
-    sdr_path = tonemap_hdr_to_sdr(
-        input_path,
-        os.path.join(temp_dir, "step2_sdr.mp4"),
-        metadata
-    )
-
-    # Step 3: modern only — skips automatically if already landscape
+    # Step 2: modern only — skips automatically if already landscape
     oriented_path = correct_orientation(
-        sdr_path,
-        os.path.join(temp_dir, "step3_oriented.mp4"),
+        input_path,
+        os.path.join(temp_dir, "step2_oriented.mp4"),
         metadata
     )
 
-    # Step 4: yadif = archival only, hqdn3d + deflicker = always
+    # Step 3: yadif = archival only, hqdn3d + deflicker = always
     #         strength adjusted by era via metadata
     denoised_path = deinterlace_and_denoise(
         oriented_path,
-        os.path.join(temp_dir, "step4_denoised.mp4"),
+        os.path.join(temp_dir, "step3_denoised.mp4"),
         metadata
     )
 
-    # Step 5: always runs, strength adjusted by era via metadata
+    # Step 4: always runs, strength adjusted by era via metadata
     stabilized_path = stabilize(
         denoised_path,
-        os.path.join(temp_dir, "step5_stabilized.mp4"),
+        os.path.join(temp_dir, "step4_stabilized.mp4"),
         temp_dir,
         metadata
     )
 
-    # Step 6: always runs — before SeedVR2 as roadmap specifies
+    # Step 5: always runs — before SeedVR2 as roadmap specifies
     person_ids = detect_and_track_persons(
         stabilized_path,
         masks_dir,
         thumbs_dir
     )
 
-    # Step 7: always runs — people removed before upscaling
+    # Step 6: always runs — people removed before upscaling
     masked_path = mask_people_for_vggt(
         stabilized_path,
-        os.path.join(temp_dir, "step7_masked.mp4"),
+        os.path.join(temp_dir, "step6_masked.mp4"),
         masks_dir,
         person_ids
     )
 
-    # Step 8: always runs — SeedVR2 primary, Real-ESRGAN fallback for
+    # Step 7: always runs — SeedVR2 primary, Real-ESRGAN fallback for
     #         short modern clips only
     restored_path = restore_and_upscale(
         masked_path,
-        os.path.join(temp_dir, "step8_restored.mp4"),
+        os.path.join(temp_dir, "step7_restored.mp4"),
         metadata
     )
 
-    # Step 9: archival only — skips automatically if not black and white
+    # Step 8: archival only — skips automatically if not black and white
     colorized_path = colorize(
         restored_path,
-        os.path.join(temp_dir, "step9_colorized.mp4"),
+        os.path.join(temp_dir, "step8_colorized.mp4"),
         metadata
     )
 
-    # Step 10: always runs
+    # Step 9: always runs
     selected_indices = select_frames(colorized_path, target_count=80)
 
-    # Step 11: always runs — final output for VGGT
+    # Step 10: always runs — final output for VGGT
     # final_frames_dir kept separate from frames_dir to avoid overwriting
     # the directory path defined at the top of this function
     final_frames_dir = normalize_and_extract_frames(
@@ -482,6 +479,5 @@ if __name__ == "__main__":
     import sys
     input_path = sys.argv[1]
     output_dir = sys.argv[2]
-    probe_metadata(input_path); 
-    #result = preprocess(input_path, output_dir)
-    #print(json.dumps(result, indent=2))
+    result = probe_metadata(input_path)
+    print(json.dumps(result, indent=2))
