@@ -23,6 +23,8 @@ import os
 import subprocess
 import json
 
+from helpers.probe_metadata_helpers import _detect_black_and_white
+
 
 # =============================================================================
 # STEP 1: PROBE VIDEO METADATA
@@ -120,8 +122,9 @@ def probe_metadata(input_path):
     rotation = int(video_stream.get("tags", {}).get("rotate", 0))
 
     is_interlaced = field_order in ["tt", "bb"]
+    is_black_and_white = _detect_black_and_white(input_path)
     
-    
+
     print("codec:", codec)
     print("field_order:", field_order)
     print("color_primaries:", color_primaries)
@@ -133,6 +136,9 @@ def probe_metadata(input_path):
     print("duration:", duration)
     print("nb_frames:", nb_frames)
     print("rotation:", rotation)
+
+    print("is_black_and_white:", is_black_and_white)
+    print("is_interlaced:", is_interlaced)
 
 # =============================================================================
 # STEP 2: HDR TO SDR TONEMAPPING
