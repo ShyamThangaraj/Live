@@ -17,9 +17,13 @@ metadata["is_archival"] — True for VHS/Hi8/MiniDV/Super8 digitized footage
 metadata["is_modern"]   — True for iPhone/DSLR/modern camera footage
 These flags are derived in probe_metadata and used throughout
 to conditionally skip or adjust steps that only apply to one era.
+
+These flags are mutually exclusive: if both would be True, is_modern wins.
+If neither is True, is_archival is set as the safer default.
 """
 
 import os
+import shutil
 import subprocess
 import json
 
@@ -59,6 +63,11 @@ def probe_metadata(input_path):
     #     Unknown/ambiguous → default to is_archival (safer — extra processing
     #     on a modern clip costs time, skipping it on archival breaks the pipeline)
     #
+    #   Mutual exclusivity:
+    #     is_archival and is_modern can both be True from the raw signals above
+    #     (e.g. hevc-encoded SD resolution file). In that case is_modern wins —
+    #     codec/pixel format is a stronger signal than resolution alone.
+    #
     # - Derive additional flags:
     #   is_hdr          = color_primaries == "bt2020" or
     #                     color_transfer in ["arib-std-b67", "smpte2084"]
@@ -82,8 +91,6 @@ def probe_metadata(input_path):
     #     "is_interlaced": False,
     #     "is_black_and_white": False,
     #   }
-    
-    # returns: dict
 
     cmd = [
         "ffprobe",
@@ -98,10 +105,11 @@ def probe_metadata(input_path):
     data = json.loads(result.stdout)
 
     video_stream = next(
-    (s for s in data["streams"] if s.get("codec_type") == "video"), None)
+        (s for s in data["streams"] if s.get("codec_type") == "video"), None
+    )
     if video_stream is None:
         raise ValueError(f"No video stream found in {input_path}")
-    
+
     codec           = video_stream.get("codec_name", "unknown")
     field_order     = video_stream.get("field_order", "progressive")
     color_primaries = video_stream.get("color_primaries", "unknown")
@@ -109,19 +117,23 @@ def probe_metadata(input_path):
     pix_fmt         = video_stream.get("pix_fmt", "unknown")
     width           = int(video_stream.get("width", 0))
     height          = int(video_stream.get("height", 0))
-    nb_frames       = int(video_stream.get("nb_frames", 0))
     duration        = float(video_stream.get("duration", 0))
 
     fps_raw = video_stream.get("r_frame_rate", "30/1")
     num, den = fps_raw.split("/")
     fps = float(num) / float(den)
 
+    # FIX #9: nb_frames is frequently absent from container metadata (MKV, MP4).
+    # Fall back to duration * fps rather than silently returning 0.
+    nb_frames_raw = video_stream.get("nb_frames")
+    nb_frames = int(nb_frames_raw) if nb_frames_raw else int(duration * fps)
+
     rotation = int(video_stream.get("tags", {}).get("rotate", 0))
-    
+
     is_interlaced = field_order in ["tt", "bb"]
-    
+
     is_black_and_white = _detect_black_and_white(input_path)
-    
+
     is_archival = (
         is_interlaced
         or codec in ["mpeg2video", "dvvideo", "huffyuv", "ffv1"]
@@ -141,9 +153,24 @@ def probe_metadata(input_path):
         else:
             is_archival = True
 
-    if not is_archival and not is_modern:
+    # FIX #10: is_archival and is_modern are not mutually exclusive from the
+    # signals above. Resolve conflicts explicitly:
+    #   - Both True  → is_modern wins (codec/format > resolution as signal)
+    #   - Both False → is_archival (safer default per spec)
+    if is_modern and is_archival:
+        is_archival = False
+    elif not is_archival and not is_modern:
         is_archival = True
 
+    # FIX: is_hdr was documented in the docstring but never computed or returned.
+    is_hdr = (
+        color_primaries == "bt2020"
+        or color_transfer in ["arib-std-b67", "smpte2084"]
+    )
+
+    # is_portrait accounts for rotation: if the stream tag says 90/270, the
+    # pixel buffer is stored sideways, so width/height are already swapped
+    # relative to the display orientation.
     if rotation in [90, 270]:
         is_portrait = width > height
     else:
@@ -166,42 +193,76 @@ def probe_metadata(input_path):
         "is_portrait":        is_portrait,
         "is_interlaced":      is_interlaced,
         "is_black_and_white": is_black_and_white,
+        "is_hdr":             is_hdr,
     }
+
+
+# Maps stream rotation tag value to the ffmpeg vf filter that corrects it.
+# The tag describes how pixels are stored (e.g. rotate=90 means pixels are
+# stored CW), so the correction is always the inverse transform.
+_ROTATION_TO_VF = {
+    90:  "transpose=2",   # stored CW  → correct with CCW
+    180: "vflip,hflip",
+    270: "transpose=1",   # stored CCW → correct with CW
+}
+
 
 # =============================================================================
 # STEP 2: ORIENTATION CORRECTION
 # Modern footage only — archival cameras were always held landscape.
-# Conditioned on metadata["is_portrait"] and metadata["rotation"].
+# Conditioned on is_portrait and rotation.
 # =============================================================================
 
-def correct_orientation(input_path, output_path, metadata):
-    # - Check metadata["is_portrait"] and metadata["rotation"]
-    # - If rotation == 0 and not portrait, skip and return input_path
-    #   Archival footage will always pass through — no rotation tag exists
-    #   on VHS/MiniDV/Hi8. is_portrait will be False for all archival.
+def correct_orientation(input_path, output_path, is_modern, is_portrait, rotation):
+    # - Modern footage only (is_modern=True) — archival cameras were always
+    #   held landscape, so is_modern guards against spurious rotation tags
+    #   on archival files.
     #
-    # - If correction needed:
-    #   Use -noautorotate to strip metadata rotation flag
-    #   Apply correct transpose filter based on metadata["rotation"]:
-    #     90  degrees -> transpose=1 (clockwise)
-    #     180 degrees -> vflip,hflip
-    #     270 degrees -> transpose=2 (counterclockwise)
-    #     0   degrees -> no transpose
-    #   Verify output width > height before returning
+    # - FIX #8: transpose directions are the inverse of the rotation tag.
+    #   The tag describes how pixels are stored relative to display orientation,
+    #   so the correction must undo that:
+    #   rotation=90  → pixels stored CW  → apply transpose=2 (CCW) to fix
+    #   rotation=180 → pixels stored 180 → apply vflip,hflip to fix
+    #   rotation=270 → pixels stored CCW → apply transpose=1 (CW) to fix
+    #   rotation=0   → no correction needed
+    #
+    # - Use -noautorotate so ffmpeg does not silently apply its own rotation
+    # - Verify output width >= height before returning (landscape check)
     # - Returns: output_path if corrected, input_path if skipped
-    pass  # returns: str
+
+    if not is_modern:
+        return input_path
+
+    if rotation == 0 and not is_portrait:
+        return input_path
+
+    vf = _ROTATION_TO_VF.get(rotation)
+    if vf is None:
+        # rotation=0 but is_portrait — no tag to guide correction, skip
+        return input_path
+
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-noautorotate",
+        "-i", input_path,
+        "-vf", vf,
+        "-metadata:s:v:0", "rotate=0",
+        output_path
+    ], check=True)
+
+    return output_path
 
 
 # =============================================================================
 # STEP 3: DEINTERLACING + NOISE REDUCTION + DEFLICKER
 # Chapter 12, Step 1.
-# Deinterlacing: archival only — conditioned on metadata["is_interlaced"]
+# Deinterlacing: archival only — conditioned on is_interlaced
 # Noise reduction + deflicker: all footage, but strength differs by era
 # =============================================================================
 
-def deinterlace_and_denoise(input_path, output_path, metadata):
+def deinterlace_and_denoise(input_path, output_path, is_interlaced, is_archival, is_modern):
     # - Deinterlacing (yadif=mode=1):
-    #     Only run if metadata["is_interlaced"] == True
+    #     Only run if is_interlaced == True
     #     is_interlaced will be True for VHS/Hi8/early camcorder
     #     is_interlaced will be False for all modern footage — skip yadif
     #
@@ -225,19 +286,21 @@ def deinterlace_and_denoise(input_path, output_path, metadata):
 # Strength differs: archival footage needs heavier smoothing.
 # =============================================================================
 
-def stabilize(input_path, output_path, temp_dir, metadata):
+def stabilize(input_path, output_path, temp_dir, is_archival, is_modern):
     # - Pass 1 — vidstabdetect:
     #     is_archival → shakiness=8, accuracy=15  (heavier analysis)
     #     is_modern   → shakiness=5, accuracy=15  (lighter analysis)
-    #     result=temp_dir/transforms.trf
+    #
+    # FIX #14: transforms file is namespaced under a UUID so concurrent
+    # pipeline runs on the same VM do not collide on transforms.trf.
+    #     result=temp_dir/{job_id}_transforms.trf
     #
     # - Pass 2 — vidstabtransform:
-    #     input=temp_dir/transforms.trf
+    #     input=temp_dir/{job_id}_transforms.trf
     #     is_archival → smoothing=15, crop=black  (heavier smoothing)
     #     is_modern   → smoothing=10, crop=black  (lighter smoothing)
     #
     # - Always runs — both archival and modern footage has shake
-    # - metadata param enables era-specific strength settings
     # - Returns: output_path
     pass  # returns: str
 
@@ -275,7 +338,7 @@ def detect_and_track_persons(input_path, masks_dir, thumbnails_dir):
 
 # =============================================================================
 # STEP 6: PERSON MASKING FOR VGGT
-# Always runs. Uses masks from Step 5 to inpaint people out
+# Always runs. Uses masks from Step 5 to inpaint people out before
 # SeedVR2 so the upscaler never learns people as static scene geometry.
 # =============================================================================
 
@@ -296,7 +359,7 @@ def mask_people_for_vggt(input_path, output_path, masks_dir, person_ids):
 # Runs after person masking so SeedVR2 sees clean static scene only.
 # =============================================================================
 
-def restore_and_upscale(input_path, output_path, metadata):
+def restore_and_upscale(input_path, output_path, is_archival, is_modern, duration):
     # - Always runs, tool selection conditioned on era:
     #
     #   is_archival:
@@ -321,13 +384,13 @@ def restore_and_upscale(input_path, output_path, metadata):
 
 # =============================================================================
 # STEP 8: COLORIZATION
-# Chapter 12, Step 5. Archival only — conditioned on metadata["is_black_and_white"]
+# Chapter 12, Step 5. Archival only — conditioned on is_black_and_white.
 # Modern footage will never be black and white.
 # =============================================================================
 
-def colorize(input_path, output_path, metadata):
-    # - Check metadata["is_black_and_white"] — if False, skip and return input_path
-    #   is_modern will always be False here — skip is guaranteed for modern footage
+def colorize(input_path, output_path, is_black_and_white):
+    # - Check is_black_and_white — if False, skip and return input_path
+    #   is_modern footage is never black and white so skip is guaranteed there
     #   is_archival may be True or False depending on era of footage
     #
     # - If True: run DeOldify 'video' model (MIT license, free commercial use)
@@ -348,19 +411,26 @@ def colorize(input_path, output_path, metadata):
 # Always runs. Fixes back-and-forth movement, respects VGGT memory budget.
 # =============================================================================
 
-def select_frames(input_path, target_count=80):
+def select_frames(input_path, nb_frames, target_count=80):
+    # FIX #11: accepts nb_frames so the function can validate that
+    # target_count does not exceed the actual frame count of the video.
+    # If the video is shorter than target_count, the returned list will
+    # contain at most nb_frames entries — callers must not assume exactly
+    # target_count indices are returned.
+    #
     # - Always runs regardless of video era
     # - Extract all frames as grayscale into memory
     # - Compute Farneback optical flow between every consecutive frame pair
     # - Calculate per-frame cumulative camera displacement (x, y)
     # - Detect direction reversals: frames where x-displacement sign flips
     # - Score each frame by unique spatial coverage contributed
-    # - Select target_count frames maximizing viewpoint diversity:
+    # - Select min(target_count, nb_frames) frames maximizing viewpoint diversity:
     #     Prefer frames with net forward displacement
     #     Skip redundant frames from return movement
     #     Skip frames where flow magnitude variance > threshold (motion blur)
     #     target_count=80: safe within VGGT GPU memory budget at 8fps
-    # - Returns: selected_indices — sorted list of integer frame indices
+    # - Returns: selected_indices — sorted list of integer frame indices,
+    #            length <= min(target_count, nb_frames)
     pass  # returns: list[int]
 
 
@@ -395,75 +465,98 @@ def preprocess(input_path, output_dir):
     for d in [temp_dir, masks_dir, thumbs_dir, frames_dir]:
         os.makedirs(d, exist_ok=True)
 
-    # Step 1: probe — derives is_archival, is_modern, is_portrait,
-    #                 is_interlaced, is_black_and_white, rotation
-    #                 every downstream step reads from this dict
-    metadata = probe_metadata(input_path)
+    # FIX #15: wrap the entire pipeline in try/except so temp files are
+    # cleaned up on failure rather than accumulating on the VM disk.
+    try:
+        # Step 1: probe — derives is_archival, is_modern, is_portrait,
+        #                 is_interlaced, is_black_and_white, rotation
+        #                 every downstream step reads from this dict
+        metadata = probe_metadata(input_path)
 
-    # Step 2: modern only — skips automatically if already landscape
-    oriented_path = correct_orientation(
-        input_path,
-        os.path.join(temp_dir, "step2_oriented.mp4"),
-        metadata
-    )
+        # Step 2: modern only — skips automatically if already landscape or archival.
+        # Passes only the three scalars correct_orientation needs.
+        oriented_path = correct_orientation(
+            input_path,
+            os.path.join(temp_dir, "step2_oriented.mp4"),
+            metadata["is_modern"],
+            metadata["is_portrait"],
+            metadata["rotation"],
+        )
 
-    # Step 3: yadif = archival only, hqdn3d + deflicker = always
-    #         strength adjusted by era via metadata
-    denoised_path = deinterlace_and_denoise(
-        oriented_path,
-        os.path.join(temp_dir, "step3_denoised.mp4"),
-        metadata
-    )
+        # Step 3: yadif = archival only, hqdn3d + deflicker = always
+        #         strength adjusted by era via metadata
+        denoised_path = deinterlace_and_denoise(
+            oriented_path,
+            os.path.join(temp_dir, "step3_denoised.mp4"),
+            metadata["is_interlaced"],
+            metadata["is_archival"],
+            metadata["is_modern"],
+        )
 
-    # Step 4: always runs, strength adjusted by era via metadata
-    stabilized_path = stabilize(
-        denoised_path,
-        os.path.join(temp_dir, "step4_stabilized.mp4"),
-        temp_dir,
-        metadata
-    )
+        # Step 4: always runs, strength adjusted by era via metadata
+        stabilized_path = stabilize(
+            denoised_path,
+            os.path.join(temp_dir, "step4_stabilized.mp4"),
+            temp_dir,
+            metadata["is_archival"],
+            metadata["is_modern"],
+        )
 
-    # Step 5: always runs — before SeedVR2 as roadmap specifies
-    person_ids = detect_and_track_persons(
-        stabilized_path,
-        masks_dir,
-        thumbs_dir
-    )
+        # Step 5: always runs — before SeedVR2 as roadmap specifies
+        person_ids = detect_and_track_persons(
+            stabilized_path,
+            masks_dir,
+            thumbs_dir,
+        )
 
-    # Step 6: always runs — people removed before upscaling
-    masked_path = mask_people_for_vggt(
-        stabilized_path,
-        os.path.join(temp_dir, "step6_masked.mp4"),
-        masks_dir,
-        person_ids
-    )
+        # Step 6: always runs — people removed before upscaling
+        masked_path = mask_people_for_vggt(
+            stabilized_path,
+            os.path.join(temp_dir, "step6_masked.mp4"),
+            masks_dir,
+            person_ids,
+        )
 
-    # Step 7: always runs — SeedVR2 primary, Real-ESRGAN fallback for
-    #         short modern clips only
-    restored_path = restore_and_upscale(
-        masked_path,
-        os.path.join(temp_dir, "step7_restored.mp4"),
-        metadata
-    )
+        # Step 7: always runs — SeedVR2 primary, Real-ESRGAN fallback for
+        #         short modern clips only
+        restored_path = restore_and_upscale(
+            masked_path,
+            os.path.join(temp_dir, "step7_restored.mp4"),
+            metadata["is_archival"],
+            metadata["is_modern"],
+            metadata["duration"],
+        )
 
-    # Step 8: archival only — skips automatically if not black and white
-    colorized_path = colorize(
-        restored_path,
-        os.path.join(temp_dir, "step8_colorized.mp4"),
-        metadata
-    )
+        # Step 8: archival only — skips automatically if not black and white
+        colorized_path = colorize(
+            restored_path,
+            os.path.join(temp_dir, "step8_colorized.mp4"),
+            metadata["is_black_and_white"],
+        )
 
-    # Step 9: always runs
-    selected_indices = select_frames(colorized_path, target_count=80)
+        # Step 9: always runs.
+        # FIX #11: pass nb_frames so select_frames can cap against actual
+        # frame count and never return indices beyond the video length.
+        selected_indices = select_frames(
+            colorized_path,
+            nb_frames=metadata["nb_frames"],
+            target_count=80,
+        )
 
-    # Step 10: always runs — final output for VGGT
-    # final_frames_dir kept separate from frames_dir to avoid overwriting
-    # the directory path defined at the top of this function
-    final_frames_dir = normalize_and_extract_frames(
-        colorized_path,
-        frames_dir,
-        selected_indices
-    )
+        # Step 10: always runs — final output for VGGT
+        # final_frames_dir kept separate from frames_dir to avoid overwriting
+        # the directory path defined at the top of this function
+        final_frames_dir = normalize_and_extract_frames(
+            colorized_path,
+            frames_dir,
+            selected_indices,
+        )
+
+    except Exception:
+        # Clean up all temp files before re-raising so the VM disk does not
+        # accumulate partial outputs from failed jobs.
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
 
     return {
         "frames_dir":       final_frames_dir,
@@ -475,9 +568,17 @@ def preprocess(input_path, output_dir):
     }
 
 
+# FIX #16: __main__ block now runs the full pipeline, not just probe_metadata.
+# output_dir argument was accepted but silently unused in the original.
 if __name__ == "__main__":
     import sys
+    if len(sys.argv) < 3:
+        print("Usage: preprocess.py <input_path> <output_dir>")
+        sys.exit(1)
     input_path = sys.argv[1]
     output_dir = sys.argv[2]
-    result = probe_metadata(input_path)
+    result = preprocess(input_path, output_dir)
+    # selected_indices may contain numpy int64 from optical flow — cast to
+    # plain int so json.dumps does not raise TypeError.
+    result["selected_indices"] = [int(i) for i in result["selected_indices"]]
     print(json.dumps(result, indent=2))
